@@ -3577,157 +3577,109 @@ function setup_nodejs() {
     fi
   fi
 }
-
-# ------------------------------------------------------------------------------
-# Installs PHP with selected modules and configures Apache/FPM support.
-#
-# Description:
-#   - Adds Sury PHP repo if needed
-#   - Installs default and user-defined modules
-#   - Patches php.ini for CLI, Apache, and FPM as needed
-#
-# Variables:
-#   PHP_VERSION                - PHP version to install (default: 8.4)
-#   PHP_MODULE                 - Additional comma-separated modules
-#   PHP_APACHE                 - Set YES to enable PHP with Apache
-#   PHP_FPM                    - Set YES to enable PHP-FPM
-#   PHP_MEMORY_LIMIT           - (default: 512M)
-#   PHP_UPLOAD_MAX_FILESIZE    - (default: 128M)
-#   PHP_POST_MAX_SIZE          - (default: 128M)
-#   PHP_MAX_EXECUTION_TIME     - (default: 300)
-# ------------------------------------------------------------------------------
-
 function setup_php() {
   local PHP_VERSION="${PHP_VERSION:-8.4}"
   local PHP_MODULE="${PHP_MODULE:-}"
   local PHP_APACHE="${PHP_APACHE:-NO}"
   local PHP_FPM="${PHP_FPM:-NO}"
-  local DISTRO_ID DISTRO_CODENAME
-  DISTRO_ID=$(awk -F= '/^ID=/{print $2}' /etc/os-release | tr -d '"')
-  DISTRO_CODENAME=$(awk -F= '/^VERSION_CODENAME=/{print $2}' /etc/os-release)
 
   local DEFAULT_MODULES="bcmath,cli,curl,gd,intl,mbstring,opcache,readline,xml,zip"
   local COMBINED_MODULES
-
   local PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-512M}"
   local PHP_UPLOAD_MAX_FILESIZE="${PHP_UPLOAD_MAX_FILESIZE:-128M}"
   local PHP_POST_MAX_SIZE="${PHP_POST_MAX_SIZE:-128M}"
   local PHP_MAX_EXECUTION_TIME="${PHP_MAX_EXECUTION_TIME:-300}"
 
-  # Merge default + user-defined modules
   if [[ -n "$PHP_MODULE" ]]; then
     COMBINED_MODULES="${DEFAULT_MODULES},${PHP_MODULE}"
   else
     COMBINED_MODULES="${DEFAULT_MODULES}"
   fi
 
-  # Deduplicate
   COMBINED_MODULES=$(echo "$COMBINED_MODULES" | tr ',' '\n' | awk '!seen[$0]++' | paste -sd, -)
 
-  # Get current PHP-CLI version
-  local CURRENT_PHP=""
-  CURRENT_PHP=$(is_tool_installed "php" 2>/dev/null) || true
+  # Ensure PHP version exists
+  if ! apt-cache show "php${PHP_VERSION}" >/dev/null 2>&1; then
+    msg_error "PHP ${PHP_VERSION} is not available in repositories"
+    return 1
+  fi
 
-  # Scenario 1: Already at target version - just update packages
-  if [[ -n "$CURRENT_PHP" && "$CURRENT_PHP" == "$PHP_VERSION" ]]; then
-    msg_info "Update PHP $PHP_VERSION"
+  # Remove all existing PHP versions
+  msg_info "Removing existing PHP versions"
+  apt purge -y 'php[0-9]*' >/dev/null 2>&1 || true
+  msg_ok "Removed existing PHP"
 
-    # Ensure Sury repo is available
-    if [[ ! -f /etc/apt/sources.list.d/php.sources ]]; then
-      manage_tool_repository "php" "$PHP_VERSION" "" "https://packages.sury.org/debsuryorg-archive-keyring.deb" || {
-        msg_error "Failed to setup PHP repository"
-        return 1
-      }
-    fi
-
-    ensure_apt_working || return 1
-
-    # Perform upgrade with retry logic (non-fatal if fails)
-    upgrade_packages_with_retry "php${PHP_VERSION}" || true
-
-    cache_installed_version "php" "$PHP_VERSION"
-    msg_ok "Update PHP $PHP_VERSION"
-  else
-    # Scenario 2: Different version installed - clean upgrade
-    if [[ -n "$CURRENT_PHP" && "$CURRENT_PHP" != "$PHP_VERSION" ]]; then
-      msg_info "Upgrade PHP from $CURRENT_PHP to $PHP_VERSION"
-      # Stop and disable ALL PHP-FPM versions
-      stop_all_services "php.*-fpm"
-      remove_old_tool_version "php"
-    else
-      msg_info "Setup PHP $PHP_VERSION"
-    fi
-
-    # Prepare repository (cleanup + validation)
-    prepare_repository_setup "php" "deb.sury.org-php" || {
-      msg_error "Failed to prepare PHP repository"
-      return 1
-    }
-
-    # Setup Sury repository
+  # Ensure Sury repo
+  if [[ ! -f /etc/apt/sources.list.d/php.sources ]]; then
     manage_tool_repository "php" "$PHP_VERSION" "" "https://packages.sury.org/debsuryorg-archive-keyring.deb" || {
       msg_error "Failed to setup PHP repository"
       return 1
     }
-
-    ensure_apt_working || return 1
   fi
 
-  # Build module list
-  local MODULE_LIST="php${PHP_VERSION}"
-  IFS=',' read -ra MODULES <<<"$COMBINED_MODULES"
-  for mod in "${MODULES[@]}"; do
-    if apt-cache show "php${PHP_VERSION}-${mod}" >/dev/null 2>&1; then
-      MODULE_LIST+=" php${PHP_VERSION}-${mod}"
-    fi
-  done
-  if [[ "$PHP_FPM" == "YES" ]]; then
-    MODULE_LIST+=" php${PHP_VERSION}-fpm"
-  fi
+  ensure_apt_working || return 1
 
-  # install apache2 with PHP support if requested
-  if [[ "$PHP_APACHE" == "YES" ]]; then
-    if ! dpkg -l 2>/dev/null | grep -q "libapache2-mod-php${PHP_VERSION}"; then
-      install_packages_with_retry "apache2" "libapache2-mod-php${PHP_VERSION}" || {
-        msg_error "Failed to install Apache with PHP module"
-        return 1
-      }
-    fi
-  fi
-
-  # Install PHP packages with retry logic
-  install_packages_with_retry $MODULE_LIST || {
-    msg_error "Failed to install PHP packages"
+  # Install base PHP
+  msg_info "Installing PHP ${PHP_VERSION}"
+  install_packages_with_retry "php${PHP_VERSION}" || {
+    msg_error "Failed to install PHP"
     return 1
   }
-  cache_installed_version "php" "$PHP_VERSION"
 
-  # Patch all relevant php.ini files
+  # Install modules
+  IFS=',' read -ra MODULES <<<"${COMBINED_MODULES}"
+  for mod in "${MODULES[@]}"; do
+    if apt-cache show "php${PHP_VERSION}-${mod}" >/dev/null 2>&1; then
+      install_packages_with_retry "php${PHP_VERSION}-${mod}"
+    else
+      msg_error "Module not found: php${PHP_VERSION}-${mod}"
+    fi
+  done
+
+  # Apache support
+  if [[ "$PHP_APACHE" == "YES" ]]; then
+    install_packages_with_retry "apache2" "libapache2-mod-php${PHP_VERSION}" || {
+      msg_error "Failed to install Apache PHP module"
+      return 1
+    }
+  fi
+
+  # PHP-FPM support
+  if [[ "$PHP_FPM" == "YES" ]]; then
+    install_packages_with_retry "php${PHP_VERSION}-fpm" || {
+      msg_error "Failed to install PHP-FPM"
+      return 1
+    }
+  fi
+
+  # Activate CLI PHP version
+  if [[ -x "/usr/bin/php${PHP_VERSION}" ]]; then
+    update-alternatives --set php "/usr/bin/php${PHP_VERSION}" >/dev/null 2>&1 || true
+  fi
+
+  # Patch php.ini
   local PHP_INI_PATHS=("/etc/php/${PHP_VERSION}/cli/php.ini")
   [[ "$PHP_FPM" == "YES" ]] && PHP_INI_PATHS+=("/etc/php/${PHP_VERSION}/fpm/php.ini")
   [[ "$PHP_APACHE" == "YES" ]] && PHP_INI_PATHS+=("/etc/php/${PHP_VERSION}/apache2/php.ini")
+
   for ini in "${PHP_INI_PATHS[@]}"; do
-    if [[ -f "$ini" ]]; then
-      $STD sed -i "s|^memory_limit = .*|memory_limit = ${PHP_MEMORY_LIMIT}|" "$ini"
-      $STD sed -i "s|^upload_max_filesize = .*|upload_max_filesize = ${PHP_UPLOAD_MAX_FILESIZE}|" "$ini"
-      $STD sed -i "s|^post_max_size = .*|post_max_size = ${PHP_POST_MAX_SIZE}|" "$ini"
-      $STD sed -i "s|^max_execution_time = .*|max_execution_time = ${PHP_MAX_EXECUTION_TIME}|" "$ini"
-    fi
+    [[ -f "$ini" ]] || continue
+    $STD sed -i "s|^memory_limit = .*|memory_limit = ${PHP_MEMORY_LIMIT}|" "$ini"
+    $STD sed -i "s|^upload_max_filesize = .*|upload_max_filesize = ${PHP_UPLOAD_MAX_FILESIZE}|" "$ini"
+    $STD sed -i "s|^post_max_size = .*|post_max_size = ${PHP_POST_MAX_SIZE}|" "$ini"
+    $STD sed -i "s|^max_execution_time = .*|max_execution_time = ${PHP_MAX_EXECUTION_TIME}|" "$ini"
   done
 
-  # Patch Apache configuration if needed
+  # Apache restart
   if [[ "$PHP_APACHE" == "YES" ]]; then
     for mod in $(ls /etc/apache2/mods-enabled/ 2>/dev/null | grep -E '^php[0-9]\.[0-9]\.conf$' | sed 's/\.conf//'); do
-      if [[ "$mod" != "php${PHP_VERSION}" ]]; then
-        $STD a2dismod "$mod" || true
-      fi
+      [[ "$mod" == "php${PHP_VERSION}" ]] || $STD a2dismod "$mod" || true
     done
-    $STD a2enmod mpm_prefork
     $STD a2enmod "php${PHP_VERSION}"
     safe_service_restart apache2 || true
   fi
 
-  # Enable and restart PHP-FPM if requested
+  # FPM restart
   if [[ "$PHP_FPM" == "YES" ]]; then
     if systemctl list-unit-files | grep -q "php${PHP_VERSION}-fpm.service"; then
       $STD systemctl enable php${PHP_VERSION}-fpm
@@ -3735,7 +3687,7 @@ function setup_php() {
     fi
   fi
 
-  msg_ok "Setup PHP $PHP_VERSION"
+  msg_ok "Setup PHP ${PHP_VERSION}"
 }
 
 # ------------------------------------------------------------------------------
